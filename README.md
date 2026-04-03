@@ -1,3 +1,11 @@
+<add key="PROVIDER_DOC_BUCKET_NAME"               value="prod-spectra-app-s3-provider-docs" />
+<add key="PROVIDER_DOC_BUCKET_REGION"              value="ap-south-1" />
+<add key="PROVIDER_TARIFF_DOCUMENT_PATH"           value="TariffDocs/" />
+<add key="PROVIDER_TARIFF_DOCUMENT_PATH_WEBSHARE"  value="OldTariffDocs/" />
+<add key="AWS_ACCESS_KEY_ID"                       value="YOUR_ACCESS_KEY" />
+<add key="AWS_SECRET_ACCESS_KEY"                   value="YOUR_SECRET_KEY" />
+
+
 Required env vars:
 1. MEMBER_DB_USER
 2. MEMBER_DB_SERVER
