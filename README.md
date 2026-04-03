@@ -2,8 +2,8 @@
 <add key="PROVIDER_DOC_BUCKET_REGION"              value="ap-south-1" />
 <add key="PROVIDER_TARIFF_DOCUMENT_PATH"           value="TariffDocs/" />
 <add key="PROVIDER_TARIFF_DOCUMENT_PATH_WEBSHARE"  value="OldTariffDocs/" />
-<add key="AWS_ACCESS_KEY_ID"                       value="YOUR_ACCESS_KEY" />
-<add key="AWS_SECRET_ACCESS_KEY"                   value="YOUR_SECRET_KEY" />
+<add key="AWS_ACCESS_KEY_ID"                       value="AKIAXAF7KDNNNDS2773J" />
+<add key="AWS_SECRET_ACCESS_KEY"                   value="xH7zDabtbtk8e/k6iCR0Cr3Xo1hAutaskPIHbClw" />
 
 
 Required env vars:
