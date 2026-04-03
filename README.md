@@ -1,3 +1,7 @@
+Old doc : 2_Suraksha_Hospital_01_04_2016_30_04_2030_133879728436966317.xls
+
+New doc : 297_Apollo_Hospitals__Jubilee_Hills__29_12_2019_31_12_2030_134193248271137546.pdf
+
   
 SELECT TOP 20
     doc.Id,
