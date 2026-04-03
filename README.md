@@ -1,94 +1,61 @@
   
-CREATE procedure [dbo].[Usp_TariffUploadDoc_FillDetails](@ProviderID int,@MOUID varchar(max) ,@TariffDocId Int,@Type varchar(10)='Mapped' )      
-as        
-begin        
-set nocount ON     
-   
-  
- If @TariffDocId > 0   
- Begin  
-  Select mp.ProviderId  ,FileName,SystemFileName,case when OMp.id is not null then 'yes' else 'no'end IsOldDoc   
-  from ProviderTariffDocs (nolock) Doc Inner Join   
-  ProviderTariff_Map (nolock) Mp On Doc.Id=Mp.DocumentId  
-  Left join (select * from ProviderTariff_Map (nolock) where mouid= 0) OMp On doc.id=omp.documentid   
-  Where Mp.Id=@TariffDocId  
- End  
-   
-Else if @ProviderID > 0 and @MOUID != ''and @MOUID != '-1' and @Type = 'NotMapped'  
- Begin  
- Select Mp.Id FileId,Mp.MOUID,Mp.Documentid  
-   , Row_Number() over(order by Mp.MOUID Desc,TariffDoc.ID Desc) SlNo  
-   ,FileName, MU.Name as UserName,TariffDoc.CreatedDateTime UpdateDate  
-   ,SystemFileName into #temp  
-   from  ProviderTariffDocs (nolock) TariffDoc   
-   Join ProviderTariff_Map Mp On TariffDoc.Id=Mp.DocumentID  
-   JOIN Lnk_UserRegions (NOLOCK) LU ON LU.ID = Mp.CREATEDUSERREGIONID  
-   JOIN Mst_Users (NOLOCK) MU ON MU.ID= LU.USERID  
-   where  Mp.ProviderID=@ProviderID and Mp.Status=1   
-   and TariffDoc.Status=1   
-   and MOUID IN (SELECT items FROM dbo.Split(@MOUID, ','))  
-  
-    
- Select max(Mp.Id) as FileId,0 MOUID,Mp.Documentid  
-   , Row_Number() over(order by Mp.Documentid Desc) SlNo  
-   ,FileName,TariffDoc.CreatedDateTime UpdateDate  
-   ,SystemFileName   
-   from  ProviderTariffDocs (nolock) TariffDoc   
-   Join ProviderTariff_Map Mp On TariffDoc.Id=Mp.DocumentID  
-   JOIN Lnk_UserRegions (NOLOCK) LU ON LU.ID = Mp.CREATEDUSERREGIONID  
-   JOIN Mst_Users (NOLOCK) MU ON MU.ID= LU.USERID  
-   where  Mp.ProviderID=@ProviderID --and Mp.Status=1   
-   and TariffDoc.Status=1   
-   and MOUID NOT IN (SELECT items FROM dbo.Split(@MOUID, ','))  
-   and Mp.Documentid not in (select documentid from #temp)  
-   Group by Mp.Documentid,FileName,TariffDoc.CreatedDateTime,systemfilename  
-  order by  UpdateDate  desc  
-  drop table #temp  
- End  
-  
-Else if @ProviderID > 0 and @MOUID != ''and @MOUID != '-1'  
- Begin  
-   Select Mp.Id FileId,Mp.MOUID  
-   , Row_Number() over(order by Mp.MOUID Desc,TariffDoc.ID Desc) SlNo  
-   ,FileName, MU.Name as UserName,TariffDoc.CreatedDateTime UpdateDate  
-   ,SystemFileName   
-   from  ProviderTariffDocs (nolock) TariffDoc   
-   Join ProviderTariff_Map Mp On TariffDoc.Id=Mp.DocumentID  
-   JOIN Lnk_UserRegions (NOLOCK) LU ON LU.ID = Mp.CREATEDUSERREGIONID  
-   JOIN Mst_Users (NOLOCK) MU ON MU.ID= LU.USERID  
-   where  Mp.ProviderID=@ProviderID and Mp.Status=1   
-   and TariffDoc.Status=1   
-   and MOUID IN (SELECT items FROM dbo.Split(@MOUID, ','))  
-  order by  UpdateDate  desc  
- End  
-Else  
- Begin  
-  --Select Row_Number() over(order by FileName asc,Id Asc) SlNo ,  
-  --Id FileId,FileName,SystemFileName,CreatedDateTime UpdateDate from ProviderTariffDocs (nolock)PDocs  
-  --Where Status=1  order by  CreatedDateTime   desc  
-  
-  --SELECT Row_Number() over(order by FileName asc,PDOCS.ID  Asc) SlNo ,  
-  --MAX(PDOCS.ID) FileId,FileName,SystemFileName,PDOCS.CREATEDDATETIME UpdateDate,MAX(MP.ID) TariffDocId  
-  --FROM PROVIDERTARIFFDOCS (NOLOCK) PDOCS  
-  --INNER JOIN PROVIDERTARIFF_MAP MP ON PDOCS.ID = MP.DOCUMENTID  
-  --WHERE PDOCS.STATUS=1 AND MP.STATUS = 1 and ProviderID=@ProviderID   
-  --GROUP BY FILENAME,SYSTEMFILENAME,PDOCS.CREATEDDATETIME ,PDOCS.id  
-  --order by  UpdateDate desc  
-  SELECT Row_Number() over(order by FileName asc,PDOCS.ID  Asc) SlNo ,  
-  MAX(PDOCS.ID) FileId,FileName,SystemFileName,PDOCS.CREATEDDATETIME UpdateDate,MAX(MP.ID) TariffDocId,MU.NAME UserName  
-  FROM PROVIDERTARIFFDOCS (NOLOCK) PDOCS  
-  JOIN PROVIDERTARIFF_MAP (NOLOCK) MP ON PDOCS.ID = MP.DOCUMENTID  
-  JOIN Lnk_UserRegions (NOLOCK) LU ON LU.ID = PDOCS.CREATEDUSERREGIONID  
-  JOIN Mst_Users (NOLOCK) MU ON MU.ID= LU.USERID  
-    
-  WHERE PDOCS.STATUS=1 and ProviderID=@ProviderID   
-  GROUP BY FILENAME,SYSTEMFILENAME,PDOCS.CREATEDDATETIME ,PDOCS.id,MU.NAME  
-  order by  UpdateDate desc  
-  
-  
- End  
-       
-End  
+SELECT TOP 20
+    doc.Id,
+    doc.FileName,
+    doc.SystemFileName,
+    doc.CreatedDateTime,
+    mp.ProviderID,
+    mp.MOUID,
+    CASE WHEN omp.id IS NOT NULL THEN 'yes' ELSE 'no' END AS isOldDoc
+FROM ProviderTariffDocs doc WITH (NOLOCK)
+JOIN ProviderTariff_Map mp WITH (NOLOCK) ON doc.Id = mp.DocumentId
+LEFT JOIN (
+    SELECT * FROM ProviderTariff_Map WITH (NOLOCK) WHERE MOUID = 0
+) omp ON doc.Id = omp.DocumentId
+WHERE doc.Status = 1
+  AND mp.Status = 1
+  AND doc.FileName LIKE '%.pdf'
+ORDER BY doc.CreatedDateTime DESC
+
+
+SELECT 
+    CASE WHEN omp.id IS NOT NULL THEN 'yes' ELSE 'no' END AS isOldDoc,
+    COUNT(*) AS Count,
+    MIN(doc.SystemFileName) AS SampleFileName
+FROM ProviderTariffDocs doc WITH (NOLOCK)
+JOIN ProviderTariff_Map mp WITH (NOLOCK) ON doc.Id = mp.DocumentId
+LEFT JOIN (
+    SELECT * FROM ProviderTariff_Map WITH (NOLOCK) WHERE MOUID = 0
+) omp ON doc.Id = omp.DocumentId
+WHERE doc.Status = 1
+GROUP BY CASE WHEN omp.id IS NOT NULL THEN 'yes' ELSE 'no' END
+```
+
+From the results you'll see `SystemFileName` values. Then go to your S3 bucket and search for one of those filenames — the folder path before the filename is your answer.
+
+For example if `SystemFileName = 'abc123.pdf'` and in S3 you find it at:
+```
+prod-spectra-app-s3-provider-docs/
+  1234/TariffDocument/abc123.pdf     ← isOldDoc = 'no'
+```
+Then `PROVIDER_TARIFF_DOCUMENT_PATH = TariffDocument/`
+
+And if `isOldDoc = 'yes'` and it's at:
+```
+  OldWebShare/xyz456.pdf             ← isOldDoc = 'yes'
+
+
+  SELECT 
+    CASE WHEN omp.id IS NOT NULL THEN 'yes' ELSE 'no' END AS isOldDoc,
+    COUNT(*) AS Count,
+    MIN(doc.SystemFileName) AS SampleFileName
+FROM ProviderTariffDocs doc WITH (NOLOCK)
+JOIN ProviderTariff_Map mp WITH (NOLOCK) ON doc.Id = mp.DocumentId
+LEFT JOIN (
+    SELECT * FROM ProviderTariff_Map WITH (NOLOCK) WHERE MOUID = 0
+) omp ON doc.Id = omp.DocumentId
+WHERE doc.Status = 1
+GROUP BY CASE WHEN omp.id IS NOT NULL THEN 'yes' ELSE 'no' END
   
   
   
