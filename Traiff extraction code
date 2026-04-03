@@ -1,0 +1,221 @@
+import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import mssql from "mssql";
+
+type ClaimTariffContext = {
+  providerId: number;
+  mouId: string;
+  slNo: number;
+};
+
+type TariffDocRow = {
+  FileId: number;
+  ProviderId: number;
+  FileName: string;
+  SystemFileName: string;
+  isOldDoc: string;
+  UpdateDate?: Date | string;
+};
+
+export type TariffPdfResult = {
+  claimId: number;
+  slNo: number;
+  providerId: number;
+  mouId: string;
+  fileId: number;
+  fileName: string;
+  s3Key: string;
+  bytes: Buffer;
+};
+
+function getRequiredEnv(name: string): string {
+  const val = process.env[name];
+  if (!val || !val.trim()) throw new Error(`Missing required env: ${name}`);
+  return val;
+}
+
+function msg(err: unknown): string {
+  return String((err as { message?: string })?.message || err || "");
+}
+
+function buildDbConfig(): mssql.config {
+  const rawUser = getRequiredEnv("MEMBER_DB_USER");
+  const [domainFromUser, userNameFromUser] = rawUser.includes("\\")
+    ? rawUser.split("\\", 2)
+    : ["", rawUser];
+
+  return {
+    server: getRequiredEnv("MEMBER_DB_SERVER"),
+    port: Number(process.env.MEMBER_DB_PORT || "1433"),
+    database: getRequiredEnv("MEMBER_DB_DATABASE"),
+    options: { encrypt: true, trustServerCertificate: true },
+    authentication: {
+      type: "ntlm",
+      options: {
+        domain: process.env.MEMBER_DB_DOMAIN || domainFromUser,
+        userName: process.env.MEMBER_DB_USERNAME || userNameFromUser,
+        password: getRequiredEnv("MEMBER_DB_PASSWORD"),
+      },
+    },
+  } as mssql.config;
+}
+
+async function getSlNo(pool: mssql.ConnectionPool, claimId: number): Promise<number> {
+  for (const table of ["Claimsdetails", "Claimsdetail"]) {
+    try {
+      const rs = await pool
+        .request()
+        .input("ClaimID", mssql.BigInt, claimId)
+        .query(`SELECT TOP 1 SlNo FROM ${table} WHERE ClaimID=@ClaimID AND ISNULL(Deleted,0)=0 ORDER BY SlNo DESC`);
+
+      const slNo = rs.recordset?.[0]?.SlNo;
+      if (slNo !== undefined && slNo !== null) return Number(slNo);
+    } catch {
+      // try next table
+    }
+  }
+
+  throw new Error(`Could not resolve SlNo for claim ${claimId}`);
+}
+
+async function getClaimTariffContext(pool: mssql.ConnectionPool, claimId: number): Promise<ClaimTariffContext> {
+  const slNo = await getSlNo(pool, claimId);
+  const rs = await pool
+    .request()
+    .input("ClaimID", mssql.BigInt, claimId)
+    .input("Slno", mssql.TinyInt, slNo)
+    .execute("USP_ClaimMedicalScrutiny_Retrieve");
+
+  const row = rs.recordset?.[0];
+  const providerId = Number(row?.ProviderID);
+  const mouId = String(row?.MOUID || "").trim();
+
+  if (!providerId || !mouId) {
+    throw new Error(`Could not resolve ProviderID/MOUID for claim ${claimId}`);
+  }
+
+  return { providerId, mouId, slNo };
+}
+
+async function getTariffDocs(pool: mssql.ConnectionPool, providerId: number, mouId: string): Promise<TariffDocRow[]> {
+  const rs = await pool
+    .request()
+    .input("ProviderID", mssql.BigInt, providerId)
+    .input("MOUId", mssql.VarChar, mouId)
+    .input("TariffDocId", mssql.BigInt, 0)
+    .input("Type", mssql.VarChar, "Mapped")
+    .execute("Usp_TariffUploadDoc_FillDetails");
+
+  return (rs.recordset || []) as TariffDocRow[];
+}
+
+function pickLatestPdfDoc(rows: TariffDocRow[]): TariffDocRow {
+  const pdfRows = rows.filter((row) => row.FileName?.toLowerCase().endsWith(".pdf"));
+  if (pdfRows.length === 0) {
+    throw new Error("No tariff PDF found for this claim");
+  }
+
+  pdfRows.sort((a, b) => {
+    const aTime = a.UpdateDate ? new Date(a.UpdateDate).getTime() : 0;
+    const bTime = b.UpdateDate ? new Date(b.UpdateDate).getTime() : 0;
+    return bTime - aTime;
+  });
+
+  return pdfRows[0];
+}
+
+function buildTariffS3Key(doc: TariffDocRow): string {
+  const providerTariffDocumentPath = getRequiredEnv("PROVIDER_TARIFF_DOCUMENT_PATH");
+  const providerTariffDocumentPathWebShare = getRequiredEnv("PROVIDER_TARIFF_DOCUMENT_PATH_WEBSHARE");
+
+  const prefix = doc.isOldDoc === "yes"
+    ? providerTariffDocumentPathWebShare
+    : `${doc.ProviderId}/${providerTariffDocumentPath}`;
+
+  return `${prefix}${doc.SystemFileName}`;
+}
+
+async function streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+export async function getTariffPdfForClaim(claimId: number): Promise<TariffPdfResult> {
+  const pool = await mssql.connect(buildDbConfig());
+
+  try {
+    const context = await getClaimTariffContext(pool, claimId);
+    const docs = await getTariffDocs(pool, context.providerId, context.mouId);
+    const pdfDoc = pickLatestPdfDoc(docs);
+    const s3Key = buildTariffS3Key(pdfDoc);
+
+    const s3 = new S3Client({
+      region: process.env.PROVIDER_DOC_BUCKET_REGION || "ap-south-1",
+    });
+
+    const response = await s3.send(
+      new GetObjectCommand({
+        Bucket: getRequiredEnv("PROVIDER_DOC_BUCKET_NAME"),
+        Key: s3Key,
+      })
+    );
+
+    if (!response.Body) {
+      throw new Error(`S3 returned an empty body for ${s3Key}`);
+    }
+
+    const bytes = await streamToBuffer(response.Body as NodeJS.ReadableStream);
+    if (bytes.length === 0) {
+      throw new Error(`The tariff PDF is empty for claim ${claimId}`);
+    }
+
+    return {
+      claimId,
+      slNo: context.slNo,
+      providerId: context.providerId,
+      mouId: context.mouId,
+      fileId: Number(pdfDoc.FileId),
+      fileName: pdfDoc.FileName,
+      s3Key,
+      bytes,
+    };
+  } finally {
+    await pool.close();
+  }
+}
+
+async function main() {
+  const rawClaimId = process.argv[2];
+  if (!rawClaimId) throw new Error("Usage: bun run get_tariff_pdf.ts <ClaimID>");
+
+  const claimId = Number(rawClaimId);
+  if (!Number.isFinite(claimId)) throw new Error(`Invalid ClaimID: ${rawClaimId}`);
+
+  const result = await getTariffPdfForClaim(claimId);
+  console.log(
+    JSON.stringify(
+      {
+        claimId: result.claimId,
+        slNo: result.slNo,
+        providerId: result.providerId,
+        mouId: result.mouId,
+        fileId: result.fileId,
+        fileName: result.fileName,
+        s3Key: result.s3Key,
+        size: result.bytes.length,
+      },
+      null,
+      2
+    )
+  );
+}
+
+if (require.main === module) {
+  main().catch((e) => {
+    console.error(`ERROR: ${msg(e)}`);
+    process.exit(1);
+  });
+}
+ 
