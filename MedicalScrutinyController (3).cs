@@ -7615,8 +7615,6 @@ namespace Enrollment.Controllers
         ///
         /// Required Web.config appSettings:
         ///   PROVIDER_DOC_BUCKET_NAME               e.g. prod-spectra-app-s3-provider-docs
-        ///   PROVIDER_TARIFF_DOCUMENT_PATH          e.g. TariffDocs/
-        ///   PROVIDER_TARIFF_DOCUMENT_PATH_WEBSHARE e.g. OldTariffDocs/
         ///   AWS_ACCESS_KEY_ID
         ///   AWS_SECRET_ACCESS_KEY
         ///   PROVIDER_DOC_BUCKET_REGION             (optional, default: ap-south-1)
@@ -7786,13 +7784,9 @@ namespace Enrollment.Controllers
                     return Json(res, JsonRequestBehavior.AllowGet);
                 }
 
-                // ── Step 4: Build S3 key ─────────────────────────────────────────
+                // ── Step 4: Locate file in S3 by searching for SystemFileName ────
                 string bucketName = System.Configuration.ConfigurationManager
                                           .AppSettings["PROVIDER_DOC_BUCKET_NAME"];
-                string docPath    = System.Configuration.ConfigurationManager
-                                          .AppSettings["PROVIDER_TARIFF_DOCUMENT_PATH"] ?? string.Empty;
-                string docPathOld = System.Configuration.ConfigurationManager
-                                          .AppSettings["PROVIDER_TARIFF_DOCUMENT_PATH_WEBSHARE"] ?? string.Empty;
                 string awsRegion  = System.Configuration.ConfigurationManager
                                           .AppSettings["PROVIDER_DOC_BUCKET_REGION"] ?? "ap-south-1";
                 string accessKey  = System.Configuration.ConfigurationManager
@@ -7814,11 +7808,32 @@ namespace Enrollment.Controllers
                     return Json(res, JsonRequestBehavior.AllowGet);
                 }
 
-                // isOldDoc == "yes" → use the webshare prefix directly
-                // otherwise         → {providerId}/{docPath}{systemFileName}
-                string s3Key = isOldDoc == "yes"
-                    ? docPathOld + systemFileName
-                    : providerId.ToString() + "/" + docPath + systemFileName;
+                // Search S3 for the exact SystemFileName — no hardcoded path prefix needed.
+                // We use the providerId as a prefix hint for new docs (fast path),
+                // then fall back to a full bucket search for old docs.
+                string s3Key = null;
+
+                // Fast path: try {providerId}/{systemFileName} variants first
+                // The folder between providerId and filename is unknown — search under providerId/
+                var candidatePrefix = providerId.ToString() + "/";
+                s3Key = await S3FindKeyByFilenameAsync(
+                    bucketName, candidatePrefix, systemFileName, awsRegion, accessKey, secretKey);
+
+                // Fallback: search entire bucket (covers isOldDoc = 'yes' and any other structure)
+                if (s3Key == null)
+                {
+                    s3Key = await S3FindKeyByFilenameAsync(
+                        bucketName, string.Empty, systemFileName, awsRegion, accessKey, secretKey);
+                }
+
+                if (s3Key == null)
+                {
+                    res.Success = false;
+                    res.Message = string.Format(
+                        "Tariff file '{0}' not found in S3 bucket '{1}'.",
+                        systemFileName, bucketName);
+                    return Json(res, JsonRequestBehavior.AllowGet);
+                }
 
                 // ── Step 5: Download from S3 ─────────────────────────────────────
                 byte[] bytes = await TariffS3DownloadAsync(
@@ -7849,6 +7864,111 @@ namespace Enrollment.Controllers
         }
 
         // ── AWS Signature V4 helpers (no SDK needed) ─────────────────────────────
+
+        // ── AWS S3 helpers ────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Lists objects under the given prefix and returns the full S3 key
+        /// of the first object whose key ends with the given filename.
+        /// Uses ListObjectsV2 (GET with ?list-type=2).
+        /// Returns null if not found.
+        /// </summary>
+        private static async Task<string> S3FindKeyByFilenameAsync(
+            string bucket, string prefix, string filename,
+            string region, string accessKey, string secretKey)
+        {
+            // We page through results using continuation tokens
+            string continuationToken = null;
+
+            do
+            {
+                var now       = DateTime.UtcNow;
+                var dateStamp = now.ToString("yyyyMMdd");
+                var amzDate   = now.ToString("yyyyMMddTHHmmssZ");
+                var host      = string.Format("{0}.s3.{1}.amazonaws.com", bucket, region);
+
+                // Build query string for ListObjectsV2
+                var qs = "list-type=2&max-keys=1000";
+                if (!string.IsNullOrEmpty(prefix))
+                    qs += "&prefix=" + Uri.EscapeDataString(prefix);
+                if (!string.IsNullOrEmpty(continuationToken))
+                    qs += "&continuation-token=" + Uri.EscapeDataString(continuationToken);
+
+                // Canonical query string must be sorted by key
+                var qsParts = qs.Split('&')
+                                .Select(p => p.Split(new[] { '=' }, 2))
+                                .OrderBy(p => p[0])
+                                .Select(p => p[0] + "=" + (p.Length > 1 ? p[1] : ""))
+                                .ToArray();
+                var sortedQs = string.Join("&", qsParts);
+
+                var credentialScope = string.Format("{0}/{1}/s3/aws4_request", dateStamp, region);
+                var credential      = accessKey + "/" + credentialScope;
+
+                var signedHeaders    = "host;x-amz-content-sha256;x-amz-date";
+                var payloadHash      = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"; // SHA256 of empty string
+                var canonicalRequest = string.Format(
+                    "GET\n/\n{0}\nhost:{1}\nx-amz-content-sha256:{2}\nx-amz-date:{3}\n\n{4}\n{2}",
+                    sortedQs, host, payloadHash, amzDate, signedHeaders);
+
+                var stringToSign = string.Format(
+                    "AWS4-HMAC-SHA256\n{0}\n{1}\n{2}",
+                    amzDate, credentialScope, S3HexHash(canonicalRequest));
+
+                var signingKey = S3GetSigningKey(secretKey, dateStamp, region);
+                var signature  = S3HexHmac(signingKey, stringToSign);
+
+                var authHeader = string.Format(
+                    "AWS4-HMAC-SHA256 Credential={0},SignedHeaders={1},Signature={2}",
+                    credential, signedHeaders, signature);
+
+                var url = string.Format("https://{0}/?{1}", host, sortedQs);
+
+                string xml;
+                using (var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) })
+                {
+                    http.DefaultRequestHeaders.TryAddWithoutValidation("x-amz-date", amzDate);
+                    http.DefaultRequestHeaders.TryAddWithoutValidation("x-amz-content-sha256", payloadHash);
+                    http.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", authHeader);
+                    var response = await http.GetAsync(url);
+                    xml = await response.Content.ReadAsStringAsync();
+                    if (!response.IsSuccessStatusCode)
+                        throw new Exception("S3 ListObjects failed: " + xml.Substring(0, Math.Min(300, xml.Length)));
+                }
+
+                // Parse XML to find matching key and next continuation token
+                // S3 ListObjectsV2 response looks like:
+                // <ListBucketResult>
+                //   <Contents><Key>path/to/file.pdf</Key></Contents>
+                //   <NextContinuationToken>xxx</NextContinuationToken>
+                //   <IsTruncated>true</IsTruncated>
+                // </ListBucketResult>
+                var keyMatches = System.Text.RegularExpressions.Regex.Matches(
+                    xml, @"<Key>([^<]+)</Key>");
+
+                foreach (System.Text.RegularExpressions.Match km in keyMatches)
+                {
+                    var key = km.Groups[1].Value;
+                    if (key.EndsWith("/" + filename) || key == filename)
+                        return key;
+                }
+
+                // Check if there are more pages
+                var truncatedMatch = System.Text.RegularExpressions.Regex.Match(
+                    xml, @"<IsTruncated>([^<]+)</IsTruncated>");
+                bool isTruncated = truncatedMatch.Success &&
+                    truncatedMatch.Groups[1].Value.Trim().ToLower() == "true";
+
+                if (!isTruncated) break;
+
+                var tokenMatch = System.Text.RegularExpressions.Regex.Match(
+                    xml, @"<NextContinuationToken>([^<]+)</NextContinuationToken>");
+                continuationToken = tokenMatch.Success ? tokenMatch.Groups[1].Value : null;
+
+            } while (!string.IsNullOrEmpty(continuationToken));
+
+            return null; // not found
+        }
 
         /// <summary>Downloads an S3 object using a Signature V4 pre-signed URL.</summary>
         private static async Task<byte[]> TariffS3DownloadAsync(
