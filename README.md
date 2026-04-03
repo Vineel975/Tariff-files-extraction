@@ -6,6 +6,19 @@
 <add key="AWS_SECRET_ACCESS_KEY"                   value="xH7zDabtbtk8e/k6iCR0Cr3Xo1hAutaskPIHbClw" />
 
 
+SELECT TOP 20
+    td.FileId,
+    td.ProviderId,
+    td.FileName,
+    td.SystemFileName,
+    td.isOldDoc,
+    td.UpdateDate
+FROM TariffUploadDoc td WITH (NOLOCK)
+WHERE td.FileName LIKE '%.pdf'
+  AND ISNULL(td.Deleted, 0) = 0
+ORDER BY td.UpdateDate DESC
+
+
 Required env vars:
 1. MEMBER_DB_USER
 2. MEMBER_DB_SERVER
